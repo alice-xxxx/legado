@@ -242,6 +242,8 @@ kotlin {
                     implementation(libs.ktor.client.core)
                     implementation(libs.ktor.client.darwin)
                     implementation(libs.coil3.network.ktor3)
+                    implementation(libs.kmp.zip.okio)
+                    implementation(libs.epub4kmp.core)
                 }
             }
             // KGP 不会自动把 iosArm64Main/iosSimulatorArm64Main 连到自定义的 iosMain,
