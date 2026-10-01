@@ -29,8 +29,8 @@ import org.jetbrains.skia.Image
 import kotlin.random.Random
 import kotlin.time.Clock
 
-/** iOS archive export uses the same cached chapters and images as the reader. */
-internal object IosBookArchiveExport {
+/** iOS/OHOS archive export uses the same cached chapters and images as the reader. */
+internal object NativeBookArchiveExport {
     suspend fun epub(book: Book, chapters: List<BookChapter>, target: File, useReplace: Boolean) {
         val epubBook = EpubBook()
         val author = book.getRealAuthor().trim()
@@ -174,7 +174,7 @@ p { text-indent: 2em; margin: 0 0 0.5em; }
         val work = File(target.parentFile ?: error("导出路径无效"), ".cbz-${Random.nextLong().toString(16)}")
         check(work.mkdirs()) { "无法创建 CBZ 临时目录" }
         try {
-            val entries = mutableListOf<IosArchiveZip.Entry>()
+            val entries = mutableListOf<NativeArchiveZip.Entry>()
             chapters.forEachIndexed { chapterIndex, chapter ->
                 currentCoroutineContext().ensureActive()
                 val content = BookHelpProviders.get().getContent(book, chapter)
@@ -187,15 +187,15 @@ p { text-indent: 2em; margin: 0 0 0.5em; }
                     if (!file.isFile) return@forEachNormalizedImgSrc
                     val ext = file.name.substringAfterLast('.', "jpg").lowercase()
                     val name = "${(chapterIndex + 1).toString().padStart(4, '0')}/${(++page).toString().padStart(4, '0')}.$ext"
-                    entries.add(IosArchiveZip.Entry(name, file))
+                    entries.add(NativeArchiveZip.Entry(name, file))
                 }
             }
             check(entries.isNotEmpty()) { "没有已缓存的图片" }
             val comicInfo = File(work, "ComicInfo.xml")
             comicInfo.writeText(ExportBookUtils.buildComicInfo(book, entries.size))
-            entries.add(IosArchiveZip.Entry("ComicInfo.xml", comicInfo))
+            entries.add(NativeArchiveZip.Entry("ComicInfo.xml", comicInfo))
             val context = currentCoroutineContext()
-            IosArchiveZip.write(target, entries) { context.ensureActive() }
+            NativeArchiveZip.write(target, entries) { context.ensureActive() }
         } finally {
             work.deleteRecursively()
         }

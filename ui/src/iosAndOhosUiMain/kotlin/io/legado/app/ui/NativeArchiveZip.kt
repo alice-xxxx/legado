@@ -9,8 +9,8 @@ import okio.Path.Companion.toPath
 import okio.buffer
 import okio.use
 
-/** iOS archive writer backed by kmp-zip; data is copied in bounded chunks. */
-internal object IosArchiveZip {
+/** iOS/OHOS archive writer backed by kmp-zip; data is copied in bounded chunks. */
+internal object NativeArchiveZip {
     data class Entry(val name: String, val file: File)
 
     fun write(target: File, entries: List<Entry>, checkCancelled: () -> Unit = {}) {
