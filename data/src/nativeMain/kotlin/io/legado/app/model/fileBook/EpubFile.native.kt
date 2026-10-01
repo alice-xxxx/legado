@@ -6,7 +6,7 @@ import io.legado.app.data.entities.Book
 import io.legado.app.data.entities.BookChapter
 import io.legado.app.format.epub.EpubBook
 import io.legado.app.format.epub.EpubContentReader
-import io.legado.app.format.epub.EpubChapter
+import io.legado.app.format.epub.chapterList
 import io.legado.app.format.epub.EpubParser
 import io.legado.app.format.epub.EpubResource
 import io.legado.app.help.AppWebDavShared
@@ -110,9 +110,6 @@ class EpubFile(var book: Book) {
         get() = field ?: synchronized(instanceLock) {
             field ?: epubBook?.spine?.also { field = it }
         }
-
-    // parseFirstPage / parseMenu 共享的章节序号计数器
-    private var durIndex = 0
 
     init {
         upBookCover(true)
@@ -262,121 +259,8 @@ class EpubFile(var book: Book) {
         }
     }
 
-    private fun getChapterList(): ArrayList<BookChapter> {
-        val chapterList = ArrayList<BookChapter>()
-        epubBook?.let { epub ->
-            val toc = epub.toc
-            if (toc.isEmpty()) {
-                // 目录为空时退化为 spine 资源列表
-                AppLog.putDebug("Epub: NCX/nav 目录为空, 退化为 spine. file: ${book.bookUrl}")
-                val spine = epub.spine
-                var i = 0
-                while (i < spine.size) {
-                    val resource = spine[i]
-                    var title = extractTitleFromResource(resource)
-                    val chapter = BookChapter()
-                    chapter.index = i
-                    chapter.bookUrl = book.bookUrl
-                    chapter.url = resource.href
-                    if (i == 0 && title.isEmpty()) {
-                        chapter.title = "封面"
-                    } else {
-                        chapter.title = title
-                    }
-                    chapterList.lastOrNull()?.putVariable("nextUrl", chapter.url)
-                    chapterList.add(chapter)
-                    i++
-                }
-            } else {
-                parseFirstPage(chapterList, toc)
-                parseMenu(chapterList, toc, 0)
-                for (i in chapterList.indices) {
-                    chapterList[i].index = i
-                }
-            }
-        }
-        return chapterList
-    }
-
-    /** 从 xhtml 资源的 <title> 标签提取标题。 */
-    private fun extractTitleFromResource(resource: EpubResource): String {
-        return runCatching {
-            val doc = Ksoup.parse(resource.data.decodeToString())
-            val elements = doc.getElementsByTag("title")
-            if (elements.isNotEmpty()) elements[0].text() else ""
-        }.getOrDefault("")
-    }
-
-    /**
-     * 获取书籍起始页内容 (封面/引言/扉页等, 第一章之前的内容)。
-     *
-     * 遍历 spine 中在第一个 toc 条目之前的资源, 为每个创建"卷首"章节。
-     */
-    private fun parseFirstPage(
-        chapterList: ArrayList<BookChapter>,
-        toc: List<EpubChapter>
-    ) {
-        val contents = spineContents ?: return
-        val firstRef = firstReadableChapter(toc) ?: return
-        val firstRefHref = firstRef.completeHref.substringBeforeLast("#")
-        var i = 0
-        durIndex = 0
-        while (i < contents.size) {
-            val content = contents[i]
-            // 检索到第一章 href 停止
-            if (firstRefHref == content.href) break
-            val chapter = BookChapter()
-            var title = extractTitleFromResource(content)
-            if (title.isEmpty()) {
-                title = "--卷首--"
-            }
-            chapter.bookUrl = book.bookUrl
-            chapter.title = title
-            chapter.url = content.href
-            // 提取 fragmentId (# 后部分)
-            val fragmentPart = content.href.substringAfter("#", "")
-            chapter.startFragmentId = fragmentPart.takeIf { it.isNotEmpty() && it != content.href }
-
-            chapterList.lastOrNull()?.endFragmentId = chapter.startFragmentId
-            chapterList.lastOrNull()?.putVariable("nextUrl", chapter.url)
-            chapterList.add(chapter)
-            durIndex++
-            i++
-        }
-    }
-
-    private fun firstReadableChapter(toc: List<EpubChapter>): EpubChapter? {
-        for (ref in toc) {
-            if (ref.resource != null) return ref
-            firstReadableChapter(ref.children)?.let { return it }
-        }
-        return null
-    }
-
-    /** 递归解析 toc 层级目录为章节列表。 */
-    private fun parseMenu(
-        chapterList: ArrayList<BookChapter>,
-        toc: List<EpubChapter>,
-        level: Int
-    ) {
-        toc.forEach { ref ->
-            if (ref.resource != null) {
-                val chapter = BookChapter()
-                chapter.bookUrl = book.bookUrl
-                chapter.title = ref.title
-                chapter.url = ref.completeHref
-                chapter.startFragmentId = ref.fragmentId
-                chapterList.lastOrNull()?.endFragmentId = chapter.startFragmentId
-                chapterList.lastOrNull()?.putVariable("nextUrl", chapter.url)
-                chapterList.add(chapter)
-                durIndex++
-            }
-            if (ref.children.isNotEmpty()) {
-                if (ref.resource != null) chapterList.lastOrNull()?.isVolume = true
-                parseMenu(chapterList, ref.children, level + 1)
-            }
-        }
-    }
+    private fun getChapterList(): ArrayList<BookChapter> =
+        epubBook?.chapterList(book.bookUrl) ?: arrayListOf()
 
     /**
      * 构造远程 epub 缓存路径: `{BookStorage.rootPath}/epubCache/{md5(bookUrl)}.epub`。

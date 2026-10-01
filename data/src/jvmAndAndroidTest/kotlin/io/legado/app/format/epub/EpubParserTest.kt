@@ -13,6 +13,63 @@ import kotlin.test.assertFalse
 
 class EpubParserTest {
     @Test
+    fun invalidNavigationFallsBackToReadableSpineChapters() {
+        for (href in listOf("missing.xhtml", "nav.xhtml")) {
+            val book = parse(nav = """<nav epub:type="toc"><ol><li><a href="$href">失效目录</a></li></ol></nav>""")
+            val chapters = book.chapterList("file:///book.epub")
+            assertEquals("OEBPS/chapter.xhtml", chapters.single().url)
+            assertContains(EpubContentReader.read(book.spine, chapters.single(), 0L), "可以阅读的正文")
+        }
+    }
+
+    @Test
+    fun nativeChapterListLinksFragmentsAndReadsEachChapter() {
+        val book = parse(
+            nav = """<nav epub:type="toc"><ol><li><a href="chapter.xhtml#one">第一章</a></li><li><a href="chapter.xhtml#two">第二章</a></li></ol></nav>""",
+            files = mapOf("OEBPS/chapter.xhtml" to "<html><body><h2 id=\"one\">第一章</h2><p>第一段正文</p><h2 id=\"two\">第二章</h2><p>第二段正文</p></body></html>"),
+        )
+        val chapters = book.chapterList("file:///book.epub")
+        assertEquals(2, chapters.size)
+        assertEquals("two", chapters.first().endFragmentId)
+        assertEquals(chapters.last().url, chapters.first().getVariable("nextUrl"))
+        val first = EpubContentReader.read(book.spine, chapters.first(), 0L)
+        assertContains(first, "第一段正文")
+        assertFalse(first.contains("第二段正文"))
+        assertContains(EpubContentReader.read(book.spine, chapters.last(), 0L), "第二段正文")
+    }
+
+    @Test
+    fun dotSegmentsInManifestResolveInsideAndOutsidePackageDirectory() {
+        for (href in listOf("./Text/../chapter.xhtml", "../chapter.xhtml")) {
+            val path = if (href.startsWith("../")) "chapter.xhtml" else "OEBPS/chapter.xhtml"
+            val book = parse(
+                manifest = """<item id="chapter" href="$href" media-type="application/xhtml+xml"/>""",
+                nav = """<nav epub:type="toc"><ol><li><a href="$href">第一章</a></li></ol></nav>""",
+                files = mapOf(path to chapter),
+            )
+            assertEquals(path, book.spine.single().href)
+            assertEquals(book.spine.single(), book.toc.single().resource)
+            assertContains(read(book, book.toc.single()), "可以阅读的正文")
+        }
+    }
+
+    @Test
+    fun coverPageResolvesHtmlAndSvgImagesRelativeToPage() {
+        for (image in listOf("""<img src="../Images/cover.jpg"/>""",
+            """<svg><image xlink:href="../Images/cover.jpg"/></svg>""")) {
+            val book = parse(
+                manifest = """<item id="chapter" href="chapter.xhtml" media-type="application/xhtml+xml"/>
+                    <item id="cover-page" href="Text/cover.xhtml" media-type="application/xhtml+xml"/>
+                    <item id="cover-image" href="Images/cover.jpg" media-type="image/jpeg"/>""",
+                guide = """<guide><reference type="cover" href="Text/cover.xhtml"/></guide>""",
+                files = mapOf("OEBPS/Text/cover.xhtml" to "<html><body>$image</body></html>",
+                    "OEBPS/Images/cover.jpg" to "image bytes"),
+            )
+            assertEquals("OEBPS/Images/cover.jpg", assertNotNull(book.coverImage).href)
+        }
+    }
+
+    @Test
     fun encodedManifestAndTocPathsResolveToActualChapter() {
         val book = parse(
             manifest = """<item id="chapter" href="Text/%E7%AC%AC%E4%B8%80%20%E7%AB%A0.xhtml" media-type="application/xhtml+xml"/>""",
@@ -179,6 +236,7 @@ class EpubParserTest {
         tocProperties: String = "nav",
         files: Map<String, String> = emptyMap(),
         version: String = "3.0",
+        guide: String = "",
     ): EpubBook {
         var opf = """
             <package xmlns:opf="http://www.idpf.org/2007/opf" version="$version">
@@ -187,6 +245,7 @@ class EpubParserTest {
               </metadata>
               <manifest>$manifest<item id="toc" href="nav.xhtml" media-type="$tocType" properties="$tocProperties"/></manifest>
               $spine
+              $guide
             </package>
         """.trimIndent()
         if (prefix.isNotEmpty()) {

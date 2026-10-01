@@ -44,20 +44,32 @@ object EpubParser {
         val version = opfDoc.elementsByLocalName("package").firstOrNull()
             ?.attr("version") ?: "2.0"
         val resources = readManifest(opfDoc, opfPath, entries)
-        val archiveResources = Resources().apply {
-            entries.forEach { (href, bytes) ->
-                // The previous reader tolerated OPF/NCX documents missing their
-                // default namespace; EPUB4KMP's DOM lookup requires it.
-                val normalized = if (href == opfPath || resources[href]?.mediaType == "application/x-dtbncx+xml") {
-                    val doc = Ksoup.parse(bytes.decodeToString(), parser = Parser.xmlParser())
-                    val root = doc.children().firstOrNull()
-                    if (root != null && !root.hasAttr("xmlns") && !root.tagName().contains(':')) {
-                        root.attr("xmlns", if (href == opfPath) "http://www.idpf.org/2007/opf"
-                            else "http://www.daisy.org/z3986/2005/ncx/")
-                        doc.outerHtml().encodeToByteArray()
-                    } else bytes
+        val normalizedEntries = entries.mapValues { (href, bytes) ->
+            // The previous reader tolerated OPF/NCX documents missing their
+            // default namespace; EPUB4KMP's DOM lookup requires it.
+            if (href == opfPath || resources[href]?.mediaType == "application/x-dtbncx+xml") {
+                val doc = Ksoup.parse(bytes.decodeToString(), parser = Parser.xmlParser())
+                val root = doc.children().firstOrNull()
+                if (root != null && !root.hasAttr("xmlns") && !root.tagName().contains(':')) {
+                    root.attr("xmlns", if (href == opfPath) "http://www.idpf.org/2007/opf"
+                        else "http://www.daisy.org/z3986/2005/ncx/")
+                    doc.outerHtml().encodeToByteArray()
                 } else bytes
-                add(Resource(normalized, href))
+            } else bytes
+        }
+        val archiveResources = Resources().apply {
+            normalizedEntries.forEach { (href, bytes) -> add(Resource(bytes, href)) }
+            // EPUB4KMP looks up decoded manifest hrefs without collapsing dot
+            // segments. Supply aliases before it makes paths relative to OPF.
+            val opfDir = opfPath.substringBeforeLast('/', "")
+            for (item in opfDoc.elementsByLocalName("manifest").firstOrNull()
+                ?.elementsByLocalName("item").orEmpty()) {
+                val href = item.attr("href")
+                val resolved = resolvePath(opfPath, href)
+                val bytes = normalizedEntries[resolved] ?: continue
+                val decoded = decodeHref(href)
+                val alias = if (opfDir.isEmpty()) decoded else "$opfDir/$decoded"
+                if (alias != resolved) add(Resource(bytes, alias))
             }
         }
         val parsed = EpubReader().readEpub(archiveResources)
@@ -79,7 +91,9 @@ object EpubParser {
         }
         val spine = parsed.spine.getSpineReferences().mapNotNull { resource(it.resource?.href) }
         check(spine.isNotEmpty()) { "EpubParser: no readable spine resources" }
-        val coverImage = resource(parsed.coverImage?.href) ?: findCoverImage(opfDoc, opfPath, resources)
+        val coverImage = coverImageResource(findCoverImage(opfDoc, opfPath, resources), resources)
+            ?: coverImageResource(resource(parsed.coverImage?.href), resources)
+            ?: coverImageResource(resource(parsed.coverPage?.href), resources)
         val tocResource = findTocResource(opfDoc, resources, version)
         fun chapter(ref: TOCReference): EpubChapter {
             val res = resource(ref.resource?.href)
@@ -215,6 +229,25 @@ object EpubParser {
                     return resources[resolved]
                 }
             }
+        }
+        return null
+    }
+
+    /** A guide/meta cover may reference an XHTML wrapper rather than an image. */
+    private fun coverImageResource(
+        candidate: EpubResource?, resources: Map<String, EpubResource>
+    ): EpubResource? {
+        candidate ?: return null
+        if (candidate.mediaType?.startsWith("image/") == true) return candidate
+        val doc = Ksoup.parse(candidate.data.decodeToString(), parser = Parser.xmlParser())
+        for (element in doc.getAllElements()) {
+            val href = when (element.localName()) {
+                "img" -> element.attr("src")
+                "image" -> element.attr("href").ifBlank { element.attr("xlink:href") }
+                else -> continue
+            }
+            val image = resources[resolvePath(candidate.href, href).substringBefore('#')]
+            if (image?.mediaType?.startsWith("image/") == true) return image
         }
         return null
     }
