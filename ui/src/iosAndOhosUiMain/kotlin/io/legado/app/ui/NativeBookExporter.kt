@@ -19,6 +19,7 @@ import kotlinx.coroutines.ensureActive
 import okio.FileSystem
 import okio.Path.Companion.toPath
 import okio.buffer
+import okio.use
 
 /** Shared file generation; each platform presents its own save/share UI. */
 internal object NativeBookExporter {
