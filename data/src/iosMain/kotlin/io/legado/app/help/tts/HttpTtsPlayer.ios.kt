@@ -17,6 +17,7 @@ import kotlinx.coroutines.IO
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -28,6 +29,8 @@ import okio.use
 import platform.AVFoundation.AVPlayer
 import platform.AVFoundation.AVPlayerItem
 import platform.AVFoundation.AVPlayerItemDidPlayToEndTimeNotification
+import platform.AVFoundation.AVPlayerItemStatusFailed
+import platform.AVFoundation.AVPlayerItemStatusReadyToPlay
 import platform.AVFoundation.AVURLAsset
 import platform.AVFoundation.currentTime
 import platform.AVFoundation.duration
@@ -36,6 +39,7 @@ import platform.AVFoundation.play
 import platform.AVFoundation.rate
 import platform.AVFoundation.replaceCurrentItemWithPlayerItem
 import platform.AVFoundation.seekToTime
+import platform.AVFoundation.timeControlStatus
 import platform.CoreMedia.CMTimeGetSeconds
 import platform.CoreMedia.CMTimeMake
 import platform.Foundation.NSNotificationCenter
@@ -59,6 +63,8 @@ class IosHttpTtsPlayer : HttpTtsPlayer {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var pendingRequest: AudioRequest? = null
     private var downloadJob: Job? = null
+    private var prepareJob: Job? = null
+    private var prepareGeneration = 0L
     private var requestGeneration = 0L
     private var audioFile: File? = null
 
@@ -157,7 +163,8 @@ class IosHttpTtsPlayer : HttpTtsPlayer {
         }
         val newItem = AVPlayerItem(asset = AVURLAsset(nsUrl, options))
         item = newItem
-        player = AVPlayer(playerItem = newItem)
+        // 先创建空播放器，在 prepareItem 注册观察器后再关联媒体项。
+        player = AVPlayer()
         AppLog.put("iOS HTTP TTS：播放器已创建，generation=$requestGeneration，fileURL=${url.startsWith("file:")}，status=${newItem.status}")
 
         // 注册播放结束监听
@@ -172,6 +179,11 @@ class IosHttpTtsPlayer : HttpTtsPlayer {
             return@onMain
         }
         downloadJob?.cancel()
+        prepareGeneration++
+        prepareJob?.cancel()
+        prepareJob = null
+        statusObserver?.dispose()
+        statusObserver = null
         val generation = ++requestGeneration
         downloadJob = scope.launch {
             val file = File(AppFilesDirs.get().cacheDir, "httpTTS/ios-${Random.nextLong()}.mp3")
@@ -231,40 +243,76 @@ class IosHttpTtsPlayer : HttpTtsPlayer {
             return
         }
         statusObserver?.dispose()
+        prepareJob?.cancel()
+        prepareJob = null
+        val preparation = ++prepareGeneration
         val generation = requestGeneration
         val callback = listener
+        var completed = false
+        fun complete(message: String?) {
+            if (completed || preparation != prepareGeneration ||
+                generation != requestGeneration || item !== target
+            ) return
+            completed = true
+            prepareJob?.cancel()
+            prepareJob = null
+            statusObserver?.dispose()
+            statusObserver = null
+            if (message == null) {
+                AppLog.put("iOS HTTP TTS：音频准备完成")
+                callback?.onReady()
+            } else {
+                player?.pause()
+                AppLog.put("iOS HTTP TTS：音频加载失败，$message")
+                callback?.onError(message)
+            }
+        }
         AppLog.put("iOS HTTP TTS：开始准备，generation=$generation，status=${target.status}，listener=${callback != null}")
         val observer = AvPlayerItemStatusObserver(
             item = target,
             onReady = {
                 onMain {
                     AppLog.put("iOS HTTP TTS：就绪回调，generation=$generation，currentGeneration=$requestGeneration，sameItem=${item === target}，listener=${callback != null}")
-                    if (generation == requestGeneration && item === target) {
-                        statusObserver = null
-                        AppLog.put("iOS HTTP TTS：音频准备完成")
-                        callback?.onReady()
-                    }
+                    complete(null)
                 }
             },
             onFailed = { message ->
                 onMain {
                     AppLog.put("iOS HTTP TTS：失败回调，generation=$generation，currentGeneration=$requestGeneration，sameItem=${item === target}，错误=$message")
-                    if (generation == requestGeneration && item === target) {
-                        statusObserver = null
-                        AppLog.put("iOS HTTP TTS：音频加载失败，$message")
-                        callback?.onError(message)
-                    }
+                    complete(message)
                 }
             },
         )
         statusObserver = observer
         observer.start()
+        if (completed) return
+        player?.replaceCurrentItemWithPlayerItem(target)
+        if (completed || preparation != prepareGeneration || generation != requestGeneration) return
+        // KVO 桥接未送达时仍按真实 status 起播/报错；只在准备阶段检查。
+        prepareJob = scope.launch {
+            repeat(PREPARE_TIMEOUT_MS / PREPARE_CHECK_INTERVAL_MS) {
+                when (target.status) {
+                    AVPlayerItemStatusReadyToPlay -> {
+                        complete(null)
+                        return@launch
+                    }
+                    AVPlayerItemStatusFailed -> {
+                        complete(target.error?.localizedDescription ?: "AVPlayerItem 加载失败")
+                        return@launch
+                    }
+                }
+                delay(PREPARE_CHECK_INTERVAL_MS.toLong())
+            }
+            // 最后再读一次，避免在超时边界把刚就绪的媒体项当作失败。
+            if (target.status == AVPlayerItemStatusReadyToPlay) complete(null)
+            else complete(target.error?.localizedDescription ?: "音频准备超时（15 秒），status=${target.status}")
+        }
     }
 
     override fun play() = onMain {
         AppLog.put("iOS HTTP TTS：调用 play，generation=$requestGeneration，player=${player != null}，status=${item?.status}，rate=${player?.rate()}")
         player?.play()
-        AppLog.put("iOS HTTP TTS：play 返回，rate=${player?.rate()}")
+        AppLog.put("iOS HTTP TTS：play 返回，rate=${player?.rate()}，timeControlStatus=${player?.timeControlStatus()}，错误=${player?.error?.localizedDescription}")
     }
 
     override fun pause() = onMain {
@@ -274,6 +322,9 @@ class IosHttpTtsPlayer : HttpTtsPlayer {
     override fun stop() = onMain {
         requestGeneration++
         downloadJob?.cancel()
+        prepareGeneration++
+        prepareJob?.cancel()
+        prepareJob = null
         statusObserver?.dispose()
         statusObserver = null
         val pl = player ?: return@onMain
@@ -321,6 +372,9 @@ class IosHttpTtsPlayer : HttpTtsPlayer {
         requestGeneration++
         downloadJob?.cancel()
         downloadJob = null
+        prepareGeneration++
+        prepareJob?.cancel()
+        prepareJob = null
         pendingRequest = null
         statusObserver?.dispose()
         statusObserver = null
@@ -338,3 +392,6 @@ class IosHttpTtsPlayer : HttpTtsPlayer {
         audioFile = null
     }
 }
+
+private const val PREPARE_TIMEOUT_MS = 15_000
+private const val PREPARE_CHECK_INTERVAL_MS = 100
